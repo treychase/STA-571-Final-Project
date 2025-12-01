@@ -1,0 +1,597 @@
+---
+title: "STA 571 Final Project - Enhanced with Streak Features"
+author: "Trey Chase, Tully Cannon"
+format: pdf
+editor: visual
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = TRUE)
+```
+```{r libraries}
+library(readr)
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+library(depmixS4)
+library(xgboost)
+library(nnet)
+library(caret)
+library(knitr)
+library(kableExtra)
+library(pROC)
+library(zoo)
+```
+```{r load-data}
+file_path = "~/Downloads/NBA_2024_Shots.csv"
+shots_df = read_csv(file_path, show_col_types = FALSE)
+```
+
+# Exploratory Data Analysis
+```{r data-prep}
+shots_df = shots_df %>%
+  mutate(
+    SHOT_MADE_NUM = as.integer(SHOT_MADE),
+    SHOT_TYPE_NUM = ifelse(SHOT_TYPE == "2PT Field Goal", 2, 3),
+    PERIOD = QUARTER,
+    TIME_REMAINING = MINS_LEFT * 60 + SECS_LEFT,
+    DISTANCE_SQUARED = SHOT_DISTANCE^2
+  ) %>%
+  filter(!is.na(SHOT_MADE))
+```
+```{r eda-summary-stats}
+shots_df %>%
+  summarise(
+    n_shots = n(),
+    make_rate = mean(SHOT_MADE),
+    avg_distance = mean(SHOT_DISTANCE),
+    sd_distance = sd(SHOT_DISTANCE)
+  ) %>%
+  kable(digits = 3, caption = "Overall Shot Statistics")
+```
+```{r eda-shot-type}
+shots_df %>%
+  group_by(SHOT_TYPE) %>%
+  summarise(
+    n = n(),
+    make_rate = mean(SHOT_MADE),
+    .groups = "drop"
+  ) %>%
+  kable(digits = 3, caption = "Shot Statistics by Type")
+```
+```{r eda-plots, fig.height=8, fig.width=10}
+p1 = ggplot(shots_df, aes(x = SHOT_DISTANCE, fill = SHOT_MADE)) +
+  geom_histogram(bins = 50, position = "identity", alpha = 0.6) +
+  labs(x = "Shot Distance (ft)", y = "Count") +
+  theme_minimal()
+
+p2 = shots_df %>%
+  group_by(SHOT_DISTANCE) %>%
+  summarise(make_rate = mean(SHOT_MADE), n = n(), .groups = "drop") %>%
+  filter(n >= 100) %>%
+  ggplot(aes(x = SHOT_DISTANCE, y = make_rate)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(se = FALSE) +
+  labs(x = "Shot Distance (ft)", y = "Make Rate") +
+  theme_minimal()
+
+p3 = ggplot(shots_df, aes(x = LOC_X, y = LOC_Y, color = SHOT_MADE)) +
+  geom_point(alpha = 0.1, size = 0.5) +
+  labs(x = "Court X", y = "Court Y") +
+  theme_minimal()
+
+p4 = shots_df %>%
+  group_by(QUARTER) %>%
+  summarise(make_rate = mean(SHOT_MADE), .groups = "drop") %>%
+  ggplot(aes(x = QUARTER, y = make_rate)) +
+  geom_line() +
+  geom_point() +
+  labs(x = "Quarter", y = "Make Rate") +
+  theme_minimal()
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+```{r team-analysis}
+team_stats = shots_df %>%
+  group_by(TEAM_NAME) %>%
+  summarise(
+    n_shots = n(),
+    make_rate = mean(SHOT_MADE),
+    avg_distance = mean(SHOT_DISTANCE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(make_rate))
+
+head(team_stats, 10) %>%
+  kable(digits = 3, caption = "Top 10 Teams by Make Rate")
+```
+
+# Enhanced Data Preparation with Streak Features
+```{r streak-features}
+# Create comprehensive streak features at team level
+shots_df_enhanced = shots_df %>%
+  arrange(TEAM_NAME, GAME_ID, QUARTER, desc(MINS_LEFT), desc(SECS_LEFT)) %>%
+  group_by(TEAM_NAME) %>%
+  mutate(
+    # Lagged made shots
+    lag1_made = lag(SHOT_MADE_NUM, 1, default = 0),
+    lag2_made = lag(SHOT_MADE_NUM, 2, default = 0),
+    lag3_made = lag(SHOT_MADE_NUM, 3, default = 0),
+    lag4_made = lag(SHOT_MADE_NUM, 4, default = 0),
+    lag5_made = lag(SHOT_MADE_NUM, 5, default = 0),
+    
+    # Recent makes (last N shots)
+    recent_makes_3 = lag1_made + lag2_made + lag3_made,
+    recent_makes_5 = lag1_made + lag2_made + lag3_made + lag4_made + lag5_made,
+    
+    # Current streak (consecutive makes)
+    streak = {
+      s = rep(0, n())
+      for(i in 2:n()) {
+        if(SHOT_MADE_NUM[i-1] == 1) {
+          s[i] = s[i-1] + 1
+        }
+      }
+      s
+    },
+    
+    # Rolling statistics
+    rolling_makes_10 = rollsumr(lag(SHOT_MADE_NUM, default = 0), 
+                                 k = 10, fill = 0, align = "right"),
+    rolling_rate_10 = rolling_makes_10 / pmin(row_number() - 1, 10)
+  ) %>%
+  ungroup()
+```
+```{r streak-eda}
+# Examine relationship between streaks and make rate
+shots_df_enhanced %>%
+  filter(recent_makes_3 >= 0) %>%
+  group_by(recent_makes_3) %>%
+  summarise(
+    n = n(),
+    make_rate = mean(SHOT_MADE),
+    .groups = "drop"
+  ) %>%
+  kable(digits = 3, caption = "Make Rate by Recent Makes (Last 3 Shots)")
+
+# Streak analysis
+shots_df_enhanced %>%
+  filter(streak <= 5) %>%
+  group_by(streak) %>%
+  summarise(
+    n = n(),
+    make_rate = mean(SHOT_MADE),
+    .groups = "drop"
+  ) %>%
+  kable(digits = 3, caption = "Make Rate by Current Streak Length")
+```
+
+# Model 1: Hidden Markov Model with Streak Covariate
+```{r hmm-team-prep}
+team_data = shots_df_enhanced %>%
+  filter(TEAM_NAME == team_stats$TEAM_NAME[1]) %>%
+  arrange(GAME_ID, QUARTER, desc(MINS_LEFT), desc(SECS_LEFT)) %>%
+  mutate(shot_num = row_number()) %>%
+  filter(!is.na(rolling_rate_10))  # Remove rows without enough history
+```
+
+## HMM Model Specification
+
+$$
+\begin{aligned}
+Y_t | S_t = k, X_t &\sim \text{Bernoulli}(\pi_{k,t}) \\
+\text{logit}(\pi_{k,t}) &= \beta_{k,0} + \beta_{k,1} \cdot \text{RecentMakes}_t \\
+S_t | S_{t-1} = j &\sim \text{Categorical}(\boldsymbol{\Gamma}_{j\cdot}) \\
+\Gamma_{jk} &= \text{Pr}(S_t = k | S_{t-1} = j)
+\end{aligned}
+$$
+```{r hmm-model}
+set.seed(571)
+
+# Create model with streak covariate
+hmm_model = depmix(
+  response = SHOT_MADE_NUM ~ recent_makes_3,
+  data = team_data,
+  nstates = 2,
+  family = binomial("logit")  # Use logit link
+)
+
+# Set reasonable starting values
+hmm_model = setpars(hmm_model, 
+                    value = c(0.5, 0.5,           # initial state probs
+                              0.9, 0.1, 0.1, 0.9,  # transition matrix
+                              0, 0.3,              # State 1: intercept, slope
+                              0.5, 0.5))           # State 2: intercept, slope
+
+hmm_fit = depmixS4::fit(hmm_model, 
+                        verbose = FALSE,
+                        emcontrol = em.control(maxit = 1000, tol = 1e-8))
+
+# Check convergence
+cat("Log-Likelihood:", logLik(hmm_fit), "\n")
+cat("AIC:", AIC(hmm_fit), "\n")
+cat("BIC:", BIC(hmm_fit), "\n")
+```
+```{r hmm-params}
+hmm_summary = summary(hmm_fit)
+print(hmm_summary)
+
+# Extract parameters
+params = getpars(hmm_fit)
+
+# Initial state probabilities
+initial_probs = params[1:2]
+names(initial_probs) = c("State 1", "State 2")
+
+# Transition matrix
+transition_matrix = matrix(
+  params[3:6],
+  nrow = 2, byrow = TRUE,
+  dimnames = list(
+    c("From State 1", "From State 2"),
+    c("To State 1", "To State 2")
+  )
+)
+
+# Response parameters (intercepts and slopes)
+state_params = data.frame(
+  State = c("State 1", "State 2"),
+  Intercept = c(params[7], params[9]),
+  Slope_RecentMakes = c(params[8], params[10])
+)
+
+kable(initial_probs, col.names = "Probability", 
+      caption = "HMM Initial State Probabilities", digits = 3)
+
+kable(transition_matrix, caption = "HMM Transition Matrix", digits = 3)
+
+kable(state_params, caption = "HMM State-Specific Parameters (Logit Scale)", 
+      digits = 3)
+```
+```{r hmm-states}
+team_data$hmm_state = posterior(hmm_fit)$state
+
+team_data %>%
+  group_by(hmm_state) %>%
+  summarise(
+    n = n(),
+    make_rate = mean(SHOT_MADE),
+    avg_distance = mean(SHOT_DISTANCE),
+    avg_recent_makes = mean(recent_makes_3),
+    .groups = "drop"
+  ) %>%
+  kable(digits = 3, caption = "Observed Statistics by HMM State")
+```
+```{r hmm-interpretation}
+# Interpret the streak effect in each state
+# Convert logit to probability for different streak values
+streak_values = 0:3
+state1_probs = plogis(state_params$Intercept[1] + 
+                      state_params$Slope_RecentMakes[1] * streak_values)
+state2_probs = plogis(state_params$Intercept[2] + 
+                      state_params$Slope_RecentMakes[2] * streak_values)
+
+streak_effects = data.frame(
+  RecentMakes = streak_values,
+  State1_Prob = state1_probs,
+  State2_Prob = state2_probs
+)
+
+kable(streak_effects, digits = 3, 
+      caption = "Predicted Make Probability by State and Recent Streak")
+```
+
+# Model 2: XGBoost with Streak Features
+```{r xgboost-prep}
+set.seed(571)
+train_idx = createDataPartition(shots_df_enhanced$SHOT_MADE, p = 0.8, list = FALSE)
+
+features = c("LOC_X", "LOC_Y", "SHOT_DISTANCE", "DISTANCE_SQUARED", 
+             "SHOT_TYPE_NUM", "QUARTER", "TIME_REMAINING",
+             "recent_makes_3", "recent_makes_5", "streak", "rolling_rate_10")
+
+train_x = as.matrix(shots_df_enhanced[train_idx, features])
+train_y = shots_df_enhanced$SHOT_MADE_NUM[train_idx]
+test_x = as.matrix(shots_df_enhanced[-train_idx, features])
+test_y = shots_df_enhanced$SHOT_MADE_NUM[-train_idx]
+
+dtrain = xgb.DMatrix(data = train_x, label = train_y)
+dtest = xgb.DMatrix(data = test_x, label = test_y)
+```
+
+## XGBoost Model Parameters
+
+$$
+\begin{aligned}
+\hat{y}_i &= \sum_{k=1}^K f_k(\mathbf{x}_i) \\
+\mathcal{L} &= \sum_{i=1}^n l(y_i, \hat{y}_i) + \sum_{k=1}^K \Omega(f_k) \\
+\Omega(f) &= \gamma T + \frac{1}{2}\lambda \|\mathbf{w}\|^2
+\end{aligned}
+$$
+```{r xgboost-model}
+xgb_params = list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  eta = 0.1,
+  max_depth = 6,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+xgb_model = xgb.train(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = list(train = dtrain, test = dtest),
+  verbose = 0
+)
+```
+```{r xgboost-importance, fig.height=6, fig.width=8}
+importance_matrix = xgb.importance(
+  feature_names = features,
+  model = xgb_model
+)
+
+xgb.plot.importance(importance_matrix, top_n = 11)
+```
+
+# Model 3: Neural Network with Streak Features
+
+## Neural Network Architecture
+
+$$
+\begin{aligned}
+\mathbf{h}^{(1)} &= \text{ReLU}(\mathbf{W}^{(1)}\mathbf{x} + \mathbf{b}^{(1)}) \\
+\mathbf{h}^{(2)} &= \text{ReLU}(\mathbf{W}^{(2)}\mathbf{h}^{(1)} + \mathbf{b}^{(2)}) \\
+\hat{y} &= \sigma(\mathbf{W}^{(3)}\mathbf{h}^{(2)} + \mathbf{b}^{(3)}) \\
+\mathcal{L} &= -\frac{1}{n}\sum_{i=1}^n [y_i \log(\hat{y}_i) + (1-y_i)\log(1-\hat{y}_i)]
+\end{aligned}
+$$
+```{r nn-prep}
+train_x_scaled = scale(train_x)
+test_x_scaled = scale(test_x, 
+                      center = attr(train_x_scaled, "scaled:center"),
+                      scale = attr(train_x_scaled, "scaled:scale"))
+
+train_df = data.frame(train_x_scaled, y = train_y)
+test_df = data.frame(test_x_scaled)
+```
+```{r nn-model}
+set.seed(571)
+nn_model = nnet(y ~ ., 
+                data = train_df, 
+                size = 32, 
+                maxit = 1000,
+                decay = 0.01, 
+                linout = FALSE, 
+                trace = FALSE)
+
+nn_preds = predict(nn_model, test_df, type = "raw")[,1]
+nn_preds_class = ifelse(nn_preds > 0.5, 1, 0)
+```
+```{r nn-larger, eval=FALSE}
+# Optional: Larger neural network
+set.seed(571)
+nn_model_large = nnet(y ~ ., 
+                      data = train_df, 
+                      size = 64, 
+                      maxit = 1000,
+                      decay = 0.01, 
+                      linout = FALSE, 
+                      trace = FALSE)
+
+nn_large_preds = predict(nn_model_large, test_df, type = "raw")[,1]
+nn_large_preds_class = ifelse(nn_large_preds > 0.5, 1, 0)
+```
+
+# Model Comparison
+```{r predictions}
+xgb_preds = predict(xgb_model, dtest)
+xgb_preds_class = ifelse(xgb_preds > 0.5, 1, 0)
+
+baseline_pred = mean(train_y)
+baseline_preds_class = ifelse(baseline_pred > 0.5, 1, 0)
+```
+```{r performance-metrics}
+compute_metrics = function(preds_prob, preds_class, actual) {
+  cm = confusionMatrix(factor(preds_class, levels = c(0,1)), 
+                       factor(actual, levels = c(0,1)))
+  
+  accuracy = cm$overall["Accuracy"]
+  precision = cm$byClass["Precision"]
+  recall = cm$byClass["Recall"]
+  f1 = cm$byClass["F1"]
+  
+  # Handle edge cases for log loss
+  preds_prob_safe = pmax(pmin(preds_prob, 1 - 1e-15), 1e-15)
+  log_loss = -mean(actual * log(preds_prob_safe) + 
+                   (1 - actual) * log(1 - preds_prob_safe))
+  
+  return(c(Accuracy = accuracy, Precision = precision, 
+           Recall = recall, F1 = f1, LogLoss = log_loss))
+}
+
+baseline_metrics = compute_metrics(
+  rep(baseline_pred, length(test_y)),
+  rep(baseline_preds_class, length(test_y)), 
+  test_y
+)
+
+xgb_metrics = compute_metrics(xgb_preds, xgb_preds_class, test_y)
+nn_metrics = compute_metrics(nn_preds, nn_preds_class, test_y)
+
+results = rbind(
+  Baseline = baseline_metrics,
+  XGBoost = xgb_metrics,
+  NeuralNet = nn_metrics
+)
+
+kable(results, digits = 4, caption = "Model Performance Comparison")
+```
+```{r roc-curves, fig.height=6, fig.width=8}
+roc_xgb = roc(test_y, xgb_preds, quiet = TRUE)
+roc_nn = roc(test_y, nn_preds, quiet = TRUE)
+
+plot(roc_xgb, col = "blue", main = "ROC Curves", lwd = 2)
+plot(roc_nn, col = "red", add = TRUE, lwd = 2)
+legend("bottomright", 
+       legend = c(paste("XGBoost AUC:", round(auc(roc_xgb), 3)),
+                  paste("Neural Net AUC:", round(auc(roc_nn), 3))),
+       col = c("blue", "red"), lty = 1, lwd = 2)
+```
+```{r auc-comparison}
+auc_results = data.frame(
+  Model = c("XGBoost", "Neural Network"),
+  AUC = c(auc(roc_xgb), auc(roc_nn))
+)
+
+kable(auc_results, digits = 4, caption = "AUC Comparison")
+```
+
+# HMM vs Modern Models
+```{r hmm-prediction-setup}
+team_test = team_data %>% 
+  filter(row_number() > nrow(team_data) * 0.8)
+
+# Get posterior state probabilities for test set
+hmm_test_idx = (nrow(team_data) - nrow(team_test) + 1):nrow(team_data)
+hmm_test_states = posterior(hmm_fit)$state[hmm_test_idx]
+
+# Calculate predicted probabilities based on state and recent makes
+hmm_pred_probs = numeric(nrow(team_test))
+for(i in 1:nrow(team_test)) {
+  state = hmm_test_states[i]
+  recent = team_test$recent_makes_3[i]
+  
+  if(state == 1) {
+    hmm_pred_probs[i] = plogis(state_params$Intercept[1] + 
+                                state_params$Slope_RecentMakes[1] * recent)
+  } else {
+    hmm_pred_probs[i] = plogis(state_params$Intercept[2] + 
+                                state_params$Slope_RecentMakes[2] * recent)
+  }
+}
+
+hmm_preds_class = ifelse(hmm_pred_probs > 0.5, 1, 0)
+hmm_test_actual = team_test$SHOT_MADE_NUM
+```
+```{r hmm-metrics}
+hmm_metrics = compute_metrics(hmm_pred_probs, hmm_preds_class, hmm_test_actual)
+
+hmm_comparison = rbind(
+  HMM = hmm_metrics,
+  Baseline = baseline_metrics
+)
+
+kable(hmm_comparison, digits = 4, 
+      caption = "HMM Performance (Team-Specific)")
+```
+```{r final-comparison}
+all_models = rbind(
+  HMM = hmm_metrics,
+  Baseline = baseline_metrics,
+  XGBoost = xgb_metrics,
+  NeuralNet = nn_metrics
+)
+
+kable(all_models, digits = 4, 
+      caption = "All Models Performance Comparison")
+```
+```{r state-transitions-viz, fig.height=6, fig.width=8}
+state_sequence = data.frame(
+  shot = 1:min(500, nrow(team_data)),
+  state = posterior(hmm_fit)$state[1:min(500, nrow(team_data))],
+  made = team_data$SHOT_MADE[1:min(500, nrow(team_data))],
+  recent_makes = team_data$recent_makes_3[1:min(500, nrow(team_data))]
+)
+
+ggplot(state_sequence, aes(x = shot, y = state, color = factor(made))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_line(aes(group = 1), alpha = 0.3) +
+  labs(x = "Shot Number", y = "HMM State", 
+       color = "Shot Made",
+       title = "HMM State Transitions Over Time") +
+  theme_minimal() +
+  scale_color_manual(values = c("0" = "red", "1" = "blue"),
+                     labels = c("Miss", "Make"))
+```
+```{r streak-effect-viz, fig.height=6, fig.width=8}
+# Visualize streak effect by state
+ggplot(streak_effects %>% 
+         pivot_longer(cols = c(State1_Prob, State2_Prob),
+                      names_to = "State", values_to = "Probability"),
+       aes(x = RecentMakes, y = Probability, color = State, group = State)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  labs(x = "Number of Recent Makes (Last 3 Shots)",
+       y = "Predicted Make Probability",
+       title = "Streak Effect by HMM State") +
+  theme_minimal() +
+  scale_color_manual(values = c("State1_Prob" = "steelblue", 
+                                 "State2_Prob" = "darkred"),
+                     labels = c("State 1", "State 2"))
+```
+```{r calibration-curves, fig.height=6, fig.width=10}
+calibration_data = data.frame(
+  pred_prob = c(xgb_preds, nn_preds),
+  actual = c(test_y, test_y),
+  model = rep(c("XGBoost", "Neural Net"), each = length(test_y))
+)
+
+calibration_data %>%
+  mutate(bin = cut(pred_prob, breaks = seq(0, 1, 0.1))) %>%
+  group_by(model, bin) %>%
+  summarise(
+    pred_mean = mean(pred_prob),
+    obs_mean = mean(actual),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n > 100) %>%
+  ggplot(aes(x = pred_mean, y = obs_mean, color = model)) +
+  geom_point(aes(size = n), alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(x = "Predicted Probability", y = "Observed Frequency",
+       title = "Calibration Curves") +
+  theme_minimal() +
+  facet_wrap(~model)
+```
+```{r streak-importance}
+# Analyze importance of streak features in XGBoost
+streak_features = c("recent_makes_3", "recent_makes_5", "streak", "rolling_rate_10")
+streak_importance = importance_matrix %>%
+  filter(Feature %in% streak_features) %>%
+  arrange(desc(Gain))
+
+kable(streak_importance, digits = 3, 
+      caption = "Importance of Streak Features in XGBoost")
+```
+
+# Discussion: Hot Hand Effect
+```{r hot-hand-analysis}
+# Test if there's evidence of "hot hand" - do recent makes predict future makes?
+hot_hand_data = shots_df_enhanced %>%
+  filter(!is.na(recent_makes_3)) %>%
+  group_by(recent_makes_3) %>%
+  summarise(
+    n = n(),
+    make_rate = mean(SHOT_MADE),
+    se = sqrt(make_rate * (1 - make_rate) / n),
+    ci_lower = make_rate - 1.96 * se,
+    ci_upper = make_rate + 1.96 * se,
+    .groups = "drop"
+  )
+
+ggplot(hot_hand_data, aes(x = recent_makes_3, y = make_rate)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  geom_line(color = "steelblue") +
+  labs(x = "Number of Recent Makes (Last 3 Shots)",
+       y = "Make Rate on Current Shot",
+       title = "Evidence for 'Hot Hand' Effect",
+       subtitle = "Error bars show 95% confidence intervals") +
+  theme_minimal()
+
+kable(hot_hand_data, digits = 4, 
+      caption = "Make Rate by Recent Shooting Performance")
+```
+
