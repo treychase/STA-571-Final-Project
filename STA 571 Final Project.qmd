@@ -14,8 +14,8 @@ execute:
 # Setup
 ```{r setup}
 library(readr)
-library(lme4)  # Load before tidyverse to prevent MASS::select from masking dplyr::select
-library(tidyverse)
+library(tidyverse)  # Load tidyverse FIRST
+library(lme4)       # Load lme4 AFTER tidyverse so dplyr::select takes precedence
 library(ggplot2)
 library(gridExtra)
 library(depmixS4)
@@ -26,6 +26,9 @@ library(knitr)
 library(kableExtra)
 library(pROC)
 library(zoo)
+
+# Explicitly handle select conflicts
+select <- dplyr::select
 
 set.seed(571)
 ```
@@ -58,7 +61,16 @@ shots_df %>%
     avg_distance = mean(SHOT_DISTANCE),
     sd_distance = sd(SHOT_DISTANCE)
   ) %>%
-  kable(digits = 3, caption = "Overall Shot Statistics")
+  kable(
+    digits = 3,
+    caption = "Overall Shot Statistics",
+    col.names = c("Total Shots", "Make Rate", "Avg Distance (ft)", "SD Distance"),
+    align = c('r', 'r', 'r', 'r'),
+    format.args = list(big.mark = ",")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), 
+                full_width = FALSE,
+                position = "left")
 ```
 
 ## Shot Statistics by Type
@@ -70,7 +82,16 @@ shots_df %>%
     make_rate = mean(SHOT_MADE),
     .groups = "drop"
   ) %>%
-  kable(digits = 3, caption = "Shot Statistics by Type")
+  kable(
+    digits = 3,
+    caption = "Shot Statistics by Type",
+    col.names = c("Shot Type", "Total Shots", "Make Rate"),
+    align = c('l', 'r', 'r'),
+    format.args = list(big.mark = ",")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 ```
 
 ## Visualizations
@@ -120,28 +141,38 @@ team_stats = shots_df %>%
   arrange(desc(make_rate))
 
 head(team_stats, 10) %>%
-  kable(digits = 3, caption = "Top 10 Teams by Make Rate")
+  kable(
+    digits = 3,
+    caption = "Top 10 Teams by Make Rate",
+    col.names = c("Team", "Total Shots", "Make Rate", "Avg Distance (ft)"),
+    align = c('l', 'r', 'r', 'r'),
+    format.args = list(big.mark = ",")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 ```
 
 # Enhanced Data Preparation with Streak Features
 ```{r streak-features}
-# Create comprehensive streak features at team level
+# IMPORTANT: Create streak features at TEAM-GAME level
+# Streaks are team-specific and reset at the start of each game
 shots_df_enhanced = shots_df %>%
   arrange(TEAM_NAME, GAME_ID, QUARTER, desc(MINS_LEFT), desc(SECS_LEFT)) %>%
-  group_by(TEAM_NAME) %>%
+  group_by(TEAM_NAME, GAME_ID) %>%  # Team-specific, game-bounded streaks
   mutate(
-    # Lagged made shots
+    # Lagged made shots (within team-game)
     lag1_made = lag(SHOT_MADE_NUM, 1, default = 0),
     lag2_made = lag(SHOT_MADE_NUM, 2, default = 0),
     lag3_made = lag(SHOT_MADE_NUM, 3, default = 0),
     lag4_made = lag(SHOT_MADE_NUM, 4, default = 0),
     lag5_made = lag(SHOT_MADE_NUM, 5, default = 0),
     
-    # Recent makes (last N shots)
+    # Recent makes (last N shots within team-game)
     recent_makes_3 = lag1_made + lag2_made + lag3_made,
     recent_makes_5 = lag1_made + lag2_made + lag3_made + lag4_made + lag5_made,
     
-    # Current streak (consecutive makes)
+    # Current streak (consecutive makes within team-game)
     streak = {
       s = rep(0, n())
       for(i in 2:n()) {
@@ -152,12 +183,19 @@ shots_df_enhanced = shots_df %>%
       s
     },
     
-    # Rolling statistics
+    # Rolling statistics (within team-game)
     rolling_makes_10 = rollsumr(lag(SHOT_MADE_NUM, default = 0),
                                 k = 10, fill = 0, align = "right"),
     rolling_rate_10 = rolling_makes_10 / pmin(row_number() - 1, 10)
   ) %>%
   ungroup()
+
+# Verify data structure
+cat("Total shots:", nrow(shots_df_enhanced), "\n")
+cat("Number of teams:", n_distinct(shots_df_enhanced$TEAM_NAME), "\n")
+cat("Number of games:", n_distinct(shots_df_enhanced$GAME_ID), "\n")
+cat("Number of team-game combinations:", 
+    n_distinct(shots_df_enhanced %>% dplyr::select(TEAM_NAME, GAME_ID)), "\n")
 ```
 
 ## Relationship Between Streaks and Make Rate
@@ -171,7 +209,16 @@ shots_df_enhanced %>%
     make_rate = mean(SHOT_MADE),
     .groups = "drop"
   ) %>%
-  kable(digits = 3, caption = "Make Rate by Recent Makes (Last 3 Shots)")
+  kable(
+    digits = 3,
+    caption = "Make Rate by Recent Makes (Last 3 Shots)",
+    col.names = c("Recent Makes (Last 3)", "N Shots", "Make Rate"),
+    align = c('c', 'r', 'r'),
+    format.args = list(big.mark = ",")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 ```
 ```{r streak-current}
 # Streak analysis
@@ -183,30 +230,48 @@ shots_df_enhanced %>%
     make_rate = mean(SHOT_MADE),
     .groups = "drop"
   ) %>%
-  kable(digits = 3, caption = "Make Rate by Current Streak Length")
+  kable(
+    digits = 3,
+    caption = "Make Rate by Current Streak Length",
+    col.names = c("Current Streak", "N Shots", "Make Rate"),
+    align = c('c', 'r', 'r'),
+    format.args = list(big.mark = ",")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 ```
 
 # Model 1: Hidden Markov Model with Streak Covariate
+
+## Data Preparation for HMM
 ```{r hmm-prep}
-# Use ALL data points - no filtering
+# Prepare data with proper sequence structure
+# Each team-game is a separate sequence
 team_data = shots_df_enhanced %>%
   arrange(TEAM_NAME, GAME_ID, QUARTER, desc(MINS_LEFT), desc(SECS_LEFT)) %>%
-  mutate(shot_num = row_number())
+  mutate(
+    streak = ifelse(is.na(streak), 0, streak),
+    team_game_id = paste(TEAM_NAME, GAME_ID, sep = "_")
+  )
 
-# Verify we have all the data
-cat("Original shots_df_enhanced rows:", nrow(shots_df_enhanced), "\n")
-cat("team_data rows:", nrow(team_data), "\n")
-cat("Rows lost:", nrow(shots_df_enhanced) - nrow(team_data), "\n\n")
+# Calculate sequence lengths (ntimes) for each team-game
+sequence_lengths = team_data %>%
+  group_by(team_game_id) %>%
+  summarise(n_shots = n(), .groups = "drop") %>%
+  pull(n_shots)
 
-# Check for NAs in key variables
+cat("Total shots in team_data:", nrow(team_data), "\n")
+cat("Number of team-game sequences:", length(sequence_lengths), "\n")
+cat("Total shots (check):", sum(sequence_lengths), "\n\n")
+
+cat("Shots per team-game summary:\n")
+print(summary(sequence_lengths))
+cat("\n")
+
+# Verify no NAs
 cat("NAs in SHOT_MADE_NUM:", sum(is.na(team_data$SHOT_MADE_NUM)), "\n")
 cat("NAs in streak:", sum(is.na(team_data$streak)), "\n")
-
-# If there are any NAs in streak, replace with 0 (reasonable for first shot)
-team_data = team_data %>%
-  mutate(streak = ifelse(is.na(streak), 0, streak))
-
-cat("NAs in streak after replacement:", sum(is.na(team_data$streak)), "\n")
 ```
 
 ## HMM Model Specification (2 States)
@@ -219,34 +284,44 @@ $$S_t|S_{t-1} = j \sim \text{Categorical}(\Gamma_j)$$
 $$\Gamma_{jk} = \Pr(S_t = k|S_{t-1} = j)$$
 
 where $k, j \in \{1, 2\}$ representing two distinct shooting states.
-```{r hmm-model, warning=FALSE}
+
+**Key Feature**: The HMM respects game boundaries through the `ntimes` parameter, ensuring that:
+- States do NOT carry over between games
+- Each team-game is treated as an independent sequence
+- Streak variables are team-specific and game-bounded
+
+## HMM Fitting
+```{r hmm-model, warning=FALSE, cache=TRUE}
 set.seed(571)
 
-# Create 2-state model with streak covariate on ALL data
+cat("Fitting HMM with game boundaries...\n\n")
+
+# Create model with ntimes to specify sequence boundaries
 hmm_model = depmix(
   response = SHOT_MADE_NUM ~ streak,
   data = team_data,
   nstates = 2,
-  family = binomial("logit")
+  family = binomial("logit"),
+  ntimes = sequence_lengths  # CRITICAL: Specifies game boundaries
 )
 
-# Set reasonable starting values for 2 states
+# Set reasonable starting values
 hmm_model = setpars(hmm_model,
                     value = c(
                       0.5, 0.5,          # initial state probs
-                      0.9, 0.1,          # transition from state 1
-                      0.1, 0.9,          # transition from state 2
-                      -0.2, 0.2,         # State 1: lower performance (intercept, slope)
-                      0.2, 0.3           # State 2: higher performance
+                      0.7, 0.3,          # From State 1
+                      0.3, 0.7,          # From State 2
+                      -0.3, 0.2,         # State 1 params
+                      0.3, 0.25          # State 2 params
                     ))
 
-# Fit with reasonable iteration limit
+# Fit model
 hmm_fit = fit(hmm_model,
-              verbose = TRUE,  # Monitor progress
+              verbose = TRUE,
               emcontrol = em.control(maxit = 5000, tol = 1e-8))
 
-# Check convergence
-cat("\nConvergence message:", hmm_fit@message, "\n")
+cat("\n=== MODEL CONVERGENCE ===\n")
+cat("Convergence message:", hmm_fit@message, "\n")
 cat("Number of iterations:", hmm_fit@ntimes, "\n")
 ```
 
@@ -269,29 +344,60 @@ params = getpars(hmm_fit)
 initial_probs = params[1:2]
 names(initial_probs) = c("State 1", "State 2")
 
-kable(initial_probs, col.names = "Probability",
-      caption = "HMM Initial State Probabilities (2 States)", digits = 3)
+kable(
+  data.frame(State = names(initial_probs), Probability = initial_probs),
+  digits = 3,
+  caption = "HMM Initial State Probabilities",
+  col.names = c("State", "Probability"),
+  align = c('l', 'r'),
+  row.names = FALSE
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 
 # Transition matrix (2x2)
 transition_matrix = matrix(
   params[3:6],
-  nrow = 2, byrow = TRUE,
-  dimnames = list(
-    c("From State 1", "From State 2"),
-    c("To State 1", "To State 2")
-  )
+  nrow = 2, byrow = TRUE
 )
 
-kable(transition_matrix, caption = "HMM Transition Matrix (2x2)", digits = 3)
+transition_df = data.frame(
+  From = c("State 1", "State 2"),
+  To_State_1 = transition_matrix[, 1],
+  To_State_2 = transition_matrix[, 2]
+)
 
-# Response parameters (intercepts and slopes for 2 states)
+kable(
+  transition_df,
+  digits = 3,
+  caption = "HMM Transition Matrix",
+  col.names = c("From State", "To State 1", "To State 2"),
+  align = c('l', 'r', 'r'),
+  row.names = FALSE
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
+
+# Response parameters
 state_params = data.frame(
   State = c("State 1", "State 2"),
   Intercept = c(params[7], params[9]),
   Slope_Streak = c(params[8], params[10])
 )
 
-kable(state_params, caption = "HMM State-Specific Parameters (Logit Scale)", digits = 3)
+kable(
+  state_params,
+  digits = 3,
+  caption = "HMM State-Specific Parameters (Logit Scale)",
+  col.names = c("State", "Intercept", "Streak Coefficient"),
+  align = c('l', 'r', 'r'),
+  row.names = FALSE
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 ```
 
 ## HMM State Interpretation (2 States)
@@ -309,7 +415,17 @@ team_data %>%
     median_streak = median(streak),
     .groups = "drop"
   ) %>%
-  kable(digits = 3, caption = "Observed Statistics by HMM State (2 States)")
+  kable(
+    digits = 3,
+    caption = "Observed Statistics by HMM State",
+    col.names = c("State", "N Shots", "Pct of Shots", "Make Rate", 
+                  "Avg Distance", "Avg Streak", "Median Streak"),
+    align = c('c', 'r', 'r', 'r', 'r', 'r', 'r'),
+    format.args = list(big.mark = ",")
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 
 # Interpret the streak effect in each state
 streak_values = 0:5
@@ -324,9 +440,46 @@ streak_effects = data.frame(
   State2_Prob = state2_probs
 )
 
-kable(streak_effects, digits = 3,
-      caption = "Predicted Make Probability by State and Current Streak Length")
+kable(
+  streak_effects,
+  digits = 3,
+  caption = "Predicted Make Probability by State and Streak",
+  col.names = c("Streak Length", "State 1 Prob", "State 2 Prob"),
+  align = c('c', 'r', 'r')
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 ```
+
+
+## HMM Game Boundary Verification
+```{r hmm-game-check}
+# Verify that states reset at game boundaries
+sample_games = team_data %>%
+  filter(TEAM_NAME == team_stats$TEAM_NAME[1]) %>%  # Take top team
+  arrange(GAME_ID, QUARTER, desc(MINS_LEFT), desc(SECS_LEFT)) %>%
+  group_by(GAME_ID) %>%
+  dplyr::slice(1) %>%  # First shot of each game - use dplyr::slice explicitly
+  ungroup() %>%  # Ungroup before head()
+  head(10)
+
+cat("First shot of each game for", team_stats$TEAM_NAME[1], ":\n")
+cat("Game boundaries are respected in the HMM via ntimes parameter\n\n")
+
+sample_games %>%
+  dplyr::select(GAME_ID, QUARTER, hmm_state, SHOT_MADE, streak) %>%
+  kable(
+    caption = "First Shot of Each Game (Sample)",
+    col.names = c("Game ID", "Quarter", "HMM State", "Made", "Streak"),
+    align = c('l', 'c', 'c', 'c', 'c')
+  ) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
+```
+
+
 
 # Model 2: XGBoost with Streak Features
 ```{r xgboost-prep}
@@ -353,7 +506,7 @@ The XGBoost model learns:
 $$\hat{y}_i = \sum_{k=1}^{K} f_k(\mathbf{x}_i)$$
 $$\mathcal{L} = \sum_{i=1}^{n} l(y_i, \hat{y}_i) + \sum_{k=1}^{K} \Omega(f_k)$$
 $$\Omega(f) = \gamma T + \frac{1}{2}\lambda ||\mathbf{w}||^2$$
-```{r xgboost-model}
+```{r xgboost-model, cache=TRUE}
 xgb_params = list(
   objective = "binary:logistic",
   eval_metric = "logloss",
@@ -387,7 +540,7 @@ $$\mathbf{h}^{(1)} = \text{ReLU}(\mathbf{W}^{(1)}\mathbf{x} + \mathbf{b}^{(1)})$
 $$\mathbf{h}^{(2)} = \text{ReLU}(\mathbf{W}^{(2)}\mathbf{h}^{(1)} + \mathbf{b}^{(2)})$$
 $$\hat{y} = \sigma(\mathbf{W}^{(3)}\mathbf{h}^{(2)} + \mathbf{b}^{(3)})$$
 $$\mathcal{L} = -\frac{1}{n}\sum_{i=1}^{n} [y_i \log(\hat{y}_i) + (1 - y_i)\log(1 - \hat{y}_i)]$$
-```{r nn-model}
+```{r nn-model, cache=TRUE}
 train_x_scaled = scale(train_x)
 test_x_scaled = scale(test_x,
                      center = attr(train_x_scaled, "scaled:center"),
@@ -398,7 +551,6 @@ test_df = data.frame(test_x_scaled)
 
 set.seed(571)
 
-# Initialize nnet model
 nn_model = nnet(y ~ .,
                data = train_df,
                size = 32,
@@ -428,7 +580,6 @@ compute_metrics = function(preds_prob, preds_class, actual) {
   recall = cm$byClass["Recall"]
   f1 = cm$byClass["F1"]
   
-  # Handle edge cases for log loss
   preds_prob_safe = pmax(pmin(preds_prob, 1 - 1e-15), 1e-15)
   log_loss = -mean(actual * log(preds_prob_safe) +
                   (1 - actual) * log(1 - preds_prob_safe))
@@ -452,7 +603,16 @@ results = rbind(
   NeuralNet = nn_metrics
 )
 
-kable(results, digits = 4, caption = "Model Performance Comparison")
+kable(
+  results,
+  digits = 4,
+  caption = "Model Performance Comparison",
+  col.names = c("Accuracy", "Precision", "Recall", "F1 Score", "Log Loss"),
+  align = c('r', 'r', 'r', 'r', 'r')
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 ```
 
 ## ROC Curves
@@ -472,7 +632,16 @@ auc_results = data.frame(
   AUC = c(auc(roc_xgb), auc(roc_nn))
 )
 
-kable(auc_results, digits = 4, caption = "AUC Comparison")
+kable(
+  auc_results,
+  digits = 4,
+  caption = "Area Under the Curve (AUC) Comparison",
+  col.names = c("Model", "AUC"),
+  align = c('l', 'r')
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 ```
 
 # HMM vs Modern Models
@@ -480,11 +649,9 @@ kable(auc_results, digits = 4, caption = "AUC Comparison")
 team_test = team_data %>%
   filter(row_number() > nrow(team_data) * 0.8)
 
-# Get posterior state probabilities for test set
 hmm_test_idx = (nrow(team_data) - nrow(team_test) + 1):nrow(team_data)
 hmm_test_states = posterior(hmm_fit, type = "viterbi")$state[hmm_test_idx]
 
-# Calculate predicted probabilities based on state and streak
 hmm_pred_probs = numeric(nrow(team_test))
 for(i in 1:nrow(team_test)) {
   state = hmm_test_states[i]
@@ -504,8 +671,16 @@ hmm_comparison = rbind(
   Baseline = baseline_metrics
 )
 
-kable(hmm_comparison, digits = 4,
-      caption = "HMM Performance (All Teams)")
+kable(
+  hmm_comparison,
+  digits = 4,
+  caption = "HMM Performance on Team-Level Data",
+  col.names = c("Accuracy", "Precision", "Recall", "F1 Score", "Log Loss"),
+  align = c('r', 'r', 'r', 'r', 'r')
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 ```
 
 ## All Models Performance
@@ -517,8 +692,16 @@ all_models = rbind(
   NeuralNet = nn_metrics
 )
 
-kable(all_models, digits = 4,
-      caption = "All Models Performance Comparison")
+kable(
+  all_models,
+  digits = 4,
+  caption = "Comprehensive Model Performance Comparison",
+  col.names = c("Accuracy", "Precision", "Recall", "F1 Score", "Log Loss"),
+  align = c('r', 'r', 'r', 'r', 'r')
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 ```
 
 ## HMM State Visualization
@@ -535,7 +718,7 @@ ggplot(state_sequence, aes(x = shot, y = state, color = factor(made))) +
   geom_line(aes(group = 1), alpha = 0.3) +
   labs(x = "Shot Number", y = "HMM State",
        color = "Shot Made",
-       title = "HMM State Transitions Over Time (2 States)") +
+       title = "HMM State Transitions Over Time (Respects Game Boundaries)") +
   theme_minimal() +
   scale_color_manual(values = c("0" = "red", "1" = "blue"),
                     labels = c("Miss", "Make")) +
@@ -544,7 +727,6 @@ ggplot(state_sequence, aes(x = shot, y = state, color = factor(made))) +
 
 ## Streak Effect by State
 ```{r streak-viz, fig.width=10, fig.height=6}
-# Visualize streak effect by state
 ggplot(streak_effects %>%
        pivot_longer(cols = c(State1_Prob, State2_Prob),
                    names_to = "State", values_to = "Probability"),
@@ -589,19 +771,27 @@ calibration_data %>%
 
 ## Importance of Streak Features
 ```{r streak-importance}
-# Analyze importance of streak features in XGBoost
 streak_features = c("recent_makes_3", "recent_makes_5", "streak", "rolling_rate_10")
 streak_importance = importance_matrix %>%
   filter(Feature %in% streak_features) %>%
-  arrange(desc(Gain))
+  arrange(desc(Gain)) %>%
+  dplyr::select(Feature, Gain, Cover, Frequency)
 
-kable(streak_importance, digits = 3,
-      caption = "Importance of Streak Features in XGBoost")
+kable(
+  streak_importance,
+  digits = 3,
+  caption = "Importance of Streak Features in XGBoost",
+  col.names = c("Feature", "Gain", "Cover", "Frequency"),
+  align = c('l', 'r', 'r', 'r'),
+  row.names = FALSE
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 ```
 
 # Discussion: Hot Hand Effect
 ```{r hot-hand-analysis}
-# Test if there's evidence of "hot hand" - do recent makes predict future makes?
 hot_hand_data = shots_df_enhanced %>%
   filter(!is.na(recent_makes_3)) %>%
   group_by(recent_makes_3) %>%
@@ -624,8 +814,17 @@ ggplot(hot_hand_data, aes(x = recent_makes_3, y = make_rate)) +
        subtitle = "Error bars show 95% confidence intervals") +
   theme_minimal()
 
-kable(hot_hand_data, digits = 4,
-      caption = "Make Rate by Recent Shooting Performance")
+kable(
+  hot_hand_data,
+  digits = 4,
+  caption = "Make Rate by Recent Shooting Performance",
+  col.names = c("Recent Makes", "N Shots", "Make Rate", "SE", "CI Lower", "CI Upper"),
+  align = c('c', 'r', 'r', 'r', 'r', 'r'),
+  format.args = list(big.mark = ",")
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 ```
 
 The analysis reveals a modest but statistically significant hot hand effect. Players who made all 3 of their last shots have a slightly higher make rate on the current shot compared to those who made 0 of their last 3 shots. However, the effect size is small, suggesting that while streaks exist, they have limited predictive power.
@@ -638,7 +837,6 @@ In this section, we explore whether certain teams exhibit stronger hot hand effe
 
 ## Hot Hand Effect by Team
 ```{r team-hot-hand}
-# Calculate hot hand effect for each team
 team_hot_hand = shots_df_enhanced %>%
   filter(!is.na(recent_makes_3)) %>%
   group_by(TEAM_NAME, recent_makes_3) %>%
@@ -647,41 +845,50 @@ team_hot_hand = shots_df_enhanced %>%
     make_rate = mean(SHOT_MADE),
     .groups = "drop"
   ) %>%
-  # Calculate difference between 3 makes and 0 makes
   pivot_wider(names_from = recent_makes_3, 
               values_from = c(make_rate, n),
               names_prefix = "streak_") %>%
   mutate(
     hot_hand_effect = make_rate_streak_3 - make_rate_streak_0,
     total_shots = n_streak_0 + n_streak_1 + n_streak_2 + n_streak_3,
-    # Only include teams with sufficient data
     enough_data = n_streak_0 >= 100 & n_streak_3 >= 50
   ) %>%
   filter(enough_data) %>%
   arrange(desc(hot_hand_effect))
 
-# Show top teams with strongest hot hand effect
-kable(head(team_hot_hand %>% 
-           dplyr::select(TEAM_NAME, hot_hand_effect, make_rate_streak_0, 
-                  make_rate_streak_3, total_shots), 15),
-      digits = 3,
-      caption = "Top 15 Teams with Strongest Hot Hand Effect",
-      col.names = c("Team", "Hot Hand Effect", "Make Rate (0/3)", 
-                   "Make Rate (3/3)", "Total Shots"))
+kable(
+  head(team_hot_hand %>% 
+       dplyr::select(TEAM_NAME, hot_hand_effect, make_rate_streak_0, 
+                     make_rate_streak_3, total_shots), 15),
+  digits = 3,
+  caption = "Top 15 Teams with Strongest Hot Hand Effect",
+  col.names = c("Team", "Hot Hand Effect", "Make Rate (0/3)", 
+                "Make Rate (3/3)", "Total Shots"),
+  align = c('l', 'r', 'r', 'r', 'r'),
+  format.args = list(big.mark = ",")
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 
-# Show teams with weakest/negative hot hand effect
-kable(tail(team_hot_hand %>% 
-           dplyr::select(TEAM_NAME, hot_hand_effect, make_rate_streak_0, 
-                  make_rate_streak_3, total_shots), 15),
-      digits = 3,
-      caption = "Bottom 15 Teams (Weakest Hot Hand Effect)",
-      col.names = c("Team", "Hot Hand Effect", "Make Rate (0/3)", 
-                   "Make Rate (3/3)", "Total Shots"))
+kable(
+  tail(team_hot_hand %>% 
+       dplyr::select(TEAM_NAME, hot_hand_effect, make_rate_streak_0, 
+                     make_rate_streak_3, total_shots), 15),
+  digits = 3,
+  caption = "Bottom 15 Teams (Weakest Hot Hand Effect)",
+  col.names = c("Team", "Hot Hand Effect", "Make Rate (0/3)", 
+                "Make Rate (3/3)", "Total Shots"),
+  align = c('l', 'r', 'r', 'r', 'r'),
+  format.args = list(big.mark = ",")
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 ```
 
 ## Visualization of Team-Specific Hot Hand Effects
 ```{r team-hot-hand-viz, fig.width=12, fig.height=8}
-# Visualize distribution of hot hand effects across teams
 ggplot(team_hot_hand, aes(x = hot_hand_effect)) +
   geom_histogram(bins = 20, fill = "steelblue", alpha = 0.7) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "red", linewidth = 1) +
@@ -691,7 +898,6 @@ ggplot(team_hot_hand, aes(x = hot_hand_effect)) +
        subtitle = "Positive values indicate stronger performance after making recent shots") +
   theme_minimal()
 
-# Show relationship between overall make rate and hot hand effect
 ggplot(team_hot_hand, aes(x = make_rate_streak_0, y = hot_hand_effect)) +
   geom_point(aes(size = total_shots), alpha = 0.6) +
   geom_smooth(method = "lm", se = TRUE, color = "steelblue", formula = y ~ x) +
@@ -705,11 +911,7 @@ ggplot(team_hot_hand, aes(x = make_rate_streak_0, y = hot_hand_effect)) +
 ```
 
 ## Statistical Test of Team Differences
-```{r team-hot-hand-test}
-# Test if hot hand effect differs significantly across teams
-# Fit a mixed effects model to account for team-level variation
-
-# Prepare data for mixed model
+```{r team-hot-hand-test, cache=TRUE}
 shots_for_model = shots_df_enhanced %>%
   filter(!is.na(recent_makes_3)) %>%
   mutate(
@@ -717,123 +919,38 @@ shots_for_model = shots_df_enhanced %>%
     TEAM_NAME = as.factor(TEAM_NAME)
   )
 
-# Fit logistic mixed model with random slope for recent_makes by team
 mixed_model = glmer(SHOT_MADE ~ recent_makes_3 + SHOT_DISTANCE + 
                     (1 + recent_makes_3 | TEAM_NAME),
                    data = shots_for_model,
                    family = binomial,
                    control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000)))
 
-# Extract random effects (team-specific hot hand effects)
 random_effects = ranef(mixed_model)$TEAM_NAME
 random_effects$TEAM_NAME = rownames(random_effects)
 colnames(random_effects)[2] = "team_hot_hand_coefficient"
 
-# Join with team stats
 team_random_effects = random_effects %>%
   left_join(team_stats, by = "TEAM_NAME") %>%
   arrange(desc(team_hot_hand_coefficient))
 
-kable(head(team_random_effects %>%
-           dplyr::select(TEAM_NAME, team_hot_hand_coefficient, make_rate, n_shots), 10),
-      digits = 3,
-      caption = "Top 10 Teams by Random Effect (Hot Hand Coefficient)",
-      col.names = c("Team", "Hot Hand Coefficient", "Overall Make Rate", "Total Shots"))
+kable(
+  head(team_random_effects %>%
+       dplyr::select(TEAM_NAME, team_hot_hand_coefficient, make_rate, n_shots), 10),
+  digits = 3,
+  caption = "Top 10 Teams by Random Effect (Hot Hand Coefficient)",
+  col.names = c("Team", "Hot Hand Coef", "Make Rate", "Total Shots"),
+  align = c('l', 'r', 'r', 'r'),
+  format.args = list(big.mark = ",")
+) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE,
+                position = "left")
 
-# Summary of mixed model
 summary(mixed_model)
-```
-
-## Team-Specific HMM Analysis
-```{r team-hmm-comparison}
-# Fit HMM for multiple teams and compare
-top_teams = head(team_stats$TEAM_NAME, 5)
-
-team_hmm_results = data.frame()
-
-for(team_name in top_teams) {
-  team_subset = shots_df_enhanced %>%
-    filter(TEAM_NAME == team_name) %>%
-    arrange(GAME_ID, QUARTER, desc(MINS_LEFT), desc(SECS_LEFT)) %>%
-    mutate(
-      shot_num = row_number(),
-      streak = ifelse(is.na(streak), 0, streak)
-    )
-  
-  if(nrow(team_subset) < 1000) next  # Skip teams with insufficient data
-  
-  # Fit HMM with streak
-  hmm_team = depmix(
-    response = SHOT_MADE_NUM ~ streak,
-    data = team_subset,
-    nstates = 2,
-    family = binomial("logit")
-  )
-  
-  hmm_team = setpars(hmm_team,
-                    value = c(0.5, 0.5,
-                             0.9, 0.1, 0.1, 0.9,
-                             0, 0.3,
-                             0.5, 0.5))
-  
-  hmm_team_fit = tryCatch({
-    fit(hmm_team, verbose = FALSE,
-        emcontrol = em.control(maxit = 1000, tol = 1e-8))
-  }, error = function(e) NULL)
-  
-  if(!is.null(hmm_team_fit)) {
-    params_team = getpars(hmm_team_fit)
-    
-    team_hmm_results = rbind(team_hmm_results, data.frame(
-      TEAM_NAME = team_name,
-      State1_Intercept = params_team[7],
-      State1_Slope = params_team[8],
-      State2_Intercept = params_team[9],
-      State2_Slope = params_team[10],
-      LogLik = logLik(hmm_team_fit),
-      AIC = AIC(hmm_team_fit)
-    ))
-  }
-}
-
-kable(team_hmm_results, digits = 3,
-      caption = "Team-Specific HMM Parameters",
-      col.names = c("Team", "State 1 Intercept", "State 1 Slope",
-                   "State 2 Intercept", "State 2 Slope", "Log-Likelihood", "AIC"))
-```
-
-## Visualization of Team-Specific Streak Effects
-```{r team-streak-viz, fig.width=12, fig.height=8}
-# Compare streak effect curves across top teams
-team_streak_curves = team_hmm_results %>%
-  rowwise() %>%
-  mutate(
-    streak_data = list(data.frame(
-      streak = 0:3,
-      State1_prob = plogis(State1_Intercept + State1_Slope * (0:3)),
-      State2_prob = plogis(State2_Intercept + State2_Slope * (0:3))
-    ))
-  ) %>%
-  unnest(streak_data)
-
-ggplot(team_streak_curves, aes(x = streak, color = TEAM_NAME)) +
-  geom_line(aes(y = State1_prob, linetype = "State 1"), linewidth = 1) +
-  geom_line(aes(y = State2_prob, linetype = "State 2"), linewidth = 1) +
-  geom_point(aes(y = State1_prob), size = 2) +
-  geom_point(aes(y = State2_prob), size = 2) +
-  labs(x = "Current Streak Length",
-       y = "Predicted Make Probability",
-       color = "Team",
-       linetype = "HMM State",
-       title = "Team-Specific Hot Hand Effects from HMM",
-       subtitle = "How do different teams respond to shooting streaks?") +
-  theme_minimal() +
-  theme(legend.position = "right")
 ```
 
 ## Summary of Team-Specific Findings
 ```{r team-summary}
-# Calculate correlation between team success and hot hand effect
 team_combined = team_hot_hand %>%
   inner_join(team_stats %>% dplyr::select(TEAM_NAME, make_rate), by = "TEAM_NAME")
 
@@ -843,7 +960,6 @@ cat("Correlation between team make rate and hot hand effect:\n")
 cat("r =", round(correlation_test$estimate, 3), "\n")
 cat("p-value =", round(correlation_test$p.value, 4), "\n\n")
 
-# Summary statistics
 cat("Hot Hand Effect Summary Statistics:\n")
 cat("Mean effect:", round(mean(team_hot_hand$hot_hand_effect), 4), "\n")
 cat("Median effect:", round(median(team_hot_hand$hot_hand_effect), 4), "\n")
@@ -878,7 +994,9 @@ Based on the team-specific analysis:
 
 4. **Feature Importance**: Streak features contributed meaningful but not dominant predictive power in the XGBoost model, with shot distance and location remaining the strongest predictors overall.
 
-5. **HMM Insights**: The Hidden Markov Model successfully identified latent shooting states that respond differently to recent success, providing a theoretically motivated framework for understanding shooting streaks.
+5. **HMM Insights**: The Hidden Markov Model successfully identified latent shooting states that respond differently to recent success, providing a theoretically motivated framework for understanding shooting streaks. The use of the `ntimes` parameter ensures that state transitions respect game boundaries, making the model more realistic.
+
+6. **Game Structure Matters**: By properly accounting for game boundaries both in streak calculations (via grouping by TEAM_NAME and GAME_ID) and in the HMM (via the ntimes parameter), we ensure that momentum doesn't artificially carry across games, leading to more realistic model estimates.
 
 ## Recommendations
 
@@ -893,3 +1011,4 @@ For future research:
 - Analyze player-specific (not just team-specific) hot hand effects
 - Explore temporal dynamics within games (quarter-specific effects)
 - Investigate whether hot hand effects vary by shot type or location
+- Consider opponent effects and game context on state transitions
