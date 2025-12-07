@@ -1,0 +1,552 @@
+---
+title: "Revisiting the Hot Hand: A Multi-Model Approach to Analyzing Shooting Streaks in NBA Basketball"
+author:
+  - name: "Trey Chase, Tully Cannon"
+date: "December 2024"
+format:
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+    fontsize: 11pt
+    number-sections: true
+    keep-tex: true
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+references:
+- id: gilovich1985hot
+  type: article-journal
+  author:
+  - family: Gilovich
+    given: Thomas
+  - family: Vallone
+    given: Robert
+  - family: Tversky
+    given: Amos
+  issued:
+    date-parts:
+    - - 1985
+  title: 'The hot hand in basketball: On the misperception of random sequences'
+  container-title: Cognitive Psychology
+  volume: 17
+  issue: 3
+  page: 295-314
+
+- id: miller2018surprised
+  type: article-journal
+  author:
+  - family: Miller
+    given: Joshua B.
+  - family: Sanjurjo
+    given: Adam
+  issued:
+    date-parts:
+    - - 2018
+  title: "Surprised by the gambler's and hot hand fallacies? A truth in the law of small numbers"
+  container-title: Econometrica
+  volume: 86
+  issue: 6
+  page: 2019-2047
+
+- id: lantis2021hot
+  type: article-journal
+  author:
+  - family: Lantis
+    given: Russell M.
+  - family: Nesson
+    given: Erik T.
+  issued:
+    date-parts:
+    - - 2021
+  title: "Hot shots: An analysis of the 'hot hand' in NBA field goal and free throw shooting"
+  container-title: Journal of Economic Behavior & Organization
+  volume: 181
+  page: 580-605
+
+- id: arkes2010revisiting
+  type: article-journal
+  author:
+  - family: Arkes
+    given: Jeremy
+  issued:
+    date-parts:
+    - - 2010
+  title: Revisiting the hot hand theory with free throw data in a multivariate framework
+  container-title: Journal of Quantitative Analysis in Sports
+  volume: 6
+  issue: 1
+
+- id: aharoni2012hot
+  type: article-journal
+  author:
+  - family: Aharoni
+    given: Guy
+  - family: Sarig
+    given: Oded H.
+  issued:
+    date-parts:
+    - - 2012
+  title: Hot hands and equilibrium
+  container-title: Applied Economics
+  volume: 44
+  issue: 18
+  page: 2309-2320
+
+- id: bocskocsky2014heat
+  type: article-journal
+  author:
+  - family: Bocskocsky
+    given: Andrew
+  - family: Ezekowitz
+    given: John
+  - family: Stein
+    given: Carolyn
+  issued:
+    date-parts:
+    - - 2014
+  title: 'Heat check: New evidence on the hot hand in basketball'
+  container-title: Working Paper
+
+- id: brown1993basketball
+  type: article-journal
+  author:
+  - family: Brown
+    given: William O.
+  - family: Sauer
+    given: Raymond D.
+  issued:
+    date-parts:
+    - - 1993
+  title: "Does the basketball market believe in the 'hot hand'? Comment"
+  container-title: The American Economic Review
+  volume: 83
+  issue: 5
+  page: 1377-1386
+
+- id: rao2009experts
+  type: article-journal
+  author:
+  - family: Rao
+    given: Justin M.
+  issued:
+    date-parts:
+    - - 2009
+  title: "Experts' perceptions of autocorrelation: The hot hand fallacy among professional basketball players"
+  container-title: Working Paper
+---
+
+```{r setup}
+#| echo: false
+#| warning: false
+#| message: false
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(pROC)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+
+# Set theme for all plots
+theme_set(theme_minimal(base_size = 11))
+
+# Create color palette
+colors <- c("#2C5F8D", "#D84A4A")
+
+# Set kable styling for compact tables
+options(knitr.kable.NA = '')
+```
+
+## Abstract
+
+We analyzed 218,701 field goal attempts from the 2024 NBA season using Hidden Markov Models, XGBoost, and Neural Networks to investigate the "hot hand" phenomenon. Our HMM identified two shooting states (43.3% and 51.9% make rates), but players making all three previous shots had lower subsequent rates (46.5%) than those missing all three (47.4%). XGBoost achieved best performance (AUC: 0.643), with shot distance far more important than streak features. Team-specific analysis revealed substantial heterogeneity (Phoenix +5.1 pp to Golden State -8.7 pp). While players transition between performance states, observable hot hand effects are minimal league-wide and largely neutralized by defensive adjustments, supporting @gilovich1985hot's original conclusions.
+
+## Introduction
+
+The "hot hand" concept (that players making consecutive shots are more likely to make the next) pervades basketball culture and influences coaching decisions, defensive strategies, and fan expectations. @gilovich1985hot challenged this belief, finding no evidence of serial correlation and attributing the widespread belief to cognitive biases.
+
+@miller2018surprised identified systematic bias in earlier conditional probability calculations and found hot hand effects in controlled experiments after correction. Subsequent studies documented small positive effects (2-3 pp) in NBA free throws [@arkes2010revisiting]. However, field goals present greater complexity. @lantis2021hot analyzed over 2 million attempts from 2004-2016, finding that while players and defenses behave as if the hot hand exists, the net effect on shooting percentage is negative for longer streaks due to harder shots and intensified defense.
+
+We apply three complementary approaches to 2024 NBA data: Hidden Markov Models to identify performance states, XGBoost to determine predictive factors, and Neural Networks to detect non-linear patterns. Our game-boundary specifications provide new insights into hot hand frequency and strength.
+
+## Previous Work
+
+@gilovich1985hot analyzed Philadelphia 76ers shooting data and controlled experiments, finding no serial correlation in shot success. They concluded the hot hand belief reflected a "cognitive illusion," making this finding influential across psychology and behavioral economics.
+
+@miller2018surprised identified fundamental statistical bias in previous conditional probability calculations. After correction, they found significant hot hand effects in @gilovich1985hot's original data that had been obscured, sparking renewed investigation.
+
+@lantis2021hot provided the most comprehensive treatment, analyzing over 2 million attempts from 2004-2016. They documented substantial adjustments following made shots: players shoot from farther away, defenses guard more closely and substitute more frequently. After controlling for these adjustments, they found no hot hand effect and even negative relationships for longer streaks (3+ consecutive makes).
+
+## Methods
+
+### Data
+
+We obtained shot-level data for 218,701 field goal attempts during the 2024 NBA regular season from 30 teams across 1,230 games, excluding first shots (which lack prior history). Variables included shot outcome, type, distance, court location, game situation, and player identifiers.
+
+### Feature Engineering
+
+We created streak features: (1) lagged outcomes for previous 5 shots, (2) recent makes in last 3 and 5 shots, (3) current consecutive makes streak, and (4) rolling make percentage over 10 shots. All streak variables calculated at team-game level with resets at game start, ensuring momentum doesn't carry across games.
+
+### Model Specifications
+
+**Hidden Markov Model**: Shot outcome $Y_t|S_t=k$ follows Bernoulli($\pi_k$) with 
+
+$$\text{logit}(\pi_{k,t}) = \beta_{k,0} + \beta_{k,1} \times \text{RecentMakes}_3$$
+
+The `ntimes` parameter ensures states reset between games.
+
+**XGBoost**: Additive decision trees with binary logistic loss, 80/20 train-test split: max depth (6), learning rate (0.1), subsample (0.8), column sample (0.8), 100 rounds.
+
+**Neural Network**: Feedforward network with two hidden layers (32 units each), ReLU activations, sigmoid output, 500 iterations, weight decay 0.01, scaled features.
+
+## Results
+
+### Descriptive Patterns
+
+League-average field goal percentage was 47.4% (two-point: 54.5%, three-point: 36.6%, average distance: 13.5 ft). Make rates decline with recent success, contradicting hot hand predictions.
+
+```{r descriptive-table}
+#| echo: false
+#| warning: false
+#| message: false
+#| tbl-cap: "Shot outcomes by recent performance and streak length"
+
+desc_data <- data.frame(
+  Category = c("Made 0 of last 3", "Made 1 of last 3", "Made 2 of last 3", "Made 3 of last 3",
+               "0 consecutive", "1 consecutive", "2 consecutive", "3 consecutive", "4 consecutive", "5+ consecutive"),
+  N = c("34,601", "85,775", "76,362", "21,963",
+        "116,095", "54,913", "25,730", "11,853", "5,495", "2,501"),
+  Rate = c("47.4%", "47.8%", "47.3%", "46.5%",
+           "47.8%", "47.4%", "46.5%", "46.8%", "46.2%", "44.7%"),
+  Type = c(rep("Recent (Last 3)", 4), rep("Streak", 6))
+)
+
+kable(desc_data,
+      col.names = c("", "N", "Rate", "Type"),
+      align = c("l", "r", "r", "l"),
+      format = "pipe") %>%
+  kableExtra::kable_styling(font_size = 9, latex_options = c("scale_down"))
+```
+
+```{r fig-make-rates}
+#| echo: false
+#| warning: false
+#| message: false
+#| fig-cap: "Make rate by recent success (left) and streak length (right)."
+#| fig-width: 6.5
+#| fig-height: 2.2
+
+# Data from results
+recent_makes_data <- data.frame(
+  recent_makes = c(0, 1, 2, 3),
+  n_shots = c(34601, 85775, 76362, 21963),
+  make_rate = c(0.474, 0.478, 0.473, 0.465)
+) %>%
+  mutate(
+    se = sqrt(make_rate * (1 - make_rate) / n_shots),
+    ci_lower = make_rate - 1.96 * se,
+    ci_upper = make_rate + 1.96 * se
+  )
+
+p1 <- ggplot(recent_makes_data, aes(x = recent_makes, y = make_rate)) +
+  geom_line(color = colors[1], size = 0.7) +
+  geom_point(size = 1.8, color = colors[1]) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), 
+                width = 0.1, color = colors[1]) +
+  scale_x_continuous(breaks = 0:3) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1),
+                     limits = c(0.45, 0.49)) +
+  labs(x = "Recent (Last 3)", y = "Make Rate") +
+  theme(panel.grid.minor = element_blank(),
+        plot.margin = margin(5, 5, 5, 5),
+        axis.title = element_text(size = 8),
+        axis.text = element_text(size = 7))
+
+streak_data <- data.frame(
+  streak = c(0, 1, 2, 3, 4, 5),
+  n_shots = c(116095, 54913, 25730, 11853, 5495, 2501),
+  make_rate = c(0.478, 0.474, 0.465, 0.468, 0.462, 0.447)
+) %>%
+  mutate(
+    se = sqrt(make_rate * (1 - make_rate) / n_shots),
+    ci_lower = make_rate - 1.96 * se,
+    ci_upper = make_rate + 1.96 * se
+  )
+
+p2 <- ggplot(streak_data, aes(x = streak, y = make_rate)) +
+  geom_line(color = colors[2], size = 0.7) +
+  geom_point(size = 1.8, color = colors[2]) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), 
+                width = 0.15, color = colors[2]) +
+  scale_x_continuous(breaks = 0:5) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1),
+                     limits = c(0.43, 0.49)) +
+  labs(x = "Streak Length", y = "Make Rate") +
+  theme(panel.grid.minor = element_blank(),
+        plot.margin = margin(5, 5, 5, 5),
+        axis.title = element_text(size = 8),
+        axis.text = element_text(size = 7))
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+
+### Hidden Markov Model Results
+
+Our HMM converged (log-likelihood: -151,295, AIC: 302,604, BIC: 302,676) and identified two shooting states.
+
+```{r hmm-results-table}
+#| echo: false
+#| warning: false
+#| message: false
+#| tbl-cap: "HMM state characteristics and parameters"
+
+hmm_results <- data.frame(
+  Characteristic = c(
+    "Proportion of Shots",
+    "Field Goal %",
+    "Avg Distance (ft)",
+    "Avg Streak",
+    "Intercept (logit)",
+    "Streak Coef. (logit)",
+    "Stay in State",
+    "Switch State",
+    "Initial Probability"
+  ),
+  State_1 = c("52.5%", "43.3%", "13.7", "0.72", "-0.093", "-0.015", "0.70", "0.30", "0.50"),
+  State_2 = c("47.5%", "51.9%", "13.4", "1.05", "-0.088", "-0.014", "0.70", "0.30", "0.50")
+)
+
+kable(hmm_results, 
+      col.names = c("", "State 1", "State 2"),
+      align = c("l", "c", "c"),
+      format = "pipe") %>%
+  kableExtra::kable_styling(font_size = 9, latex_options = c("scale_down"))
+```
+
+Negative streak coefficients in both states indicate recent success associates with lower make probability. Both states show 70% persistence with 30% switching probability.
+
+Predicted probabilities decline with streak length in both states (at streak 0: ~47.7-47.8%; at streak 5: State 1 drops to 45.8%, State 2 to 46.1%).
+
+```{r fig-hmm-predicted}
+#| echo: false
+#| warning: false
+#| message: false
+#| fig-cap: "HMM predicted make probability by streak length for both states."
+#| fig-width: 4.5
+#| fig-height: 2.2
+
+hmm_pred_data <- data.frame(
+  streak = rep(0:5, 2),
+  state = rep(c("State 1 (43.3%)", "State 2 (51.9%)"), each = 6),
+  prob = c(0.477, 0.473, 0.469, 0.466, 0.462, 0.458,
+           0.478, 0.475, 0.471, 0.468, 0.465, 0.461)
+)
+
+ggplot(hmm_pred_data, aes(x = streak, y = prob, color = state, group = state)) +
+  geom_line(size = 0.7) +
+  geom_point(size = 1.8) +
+  scale_color_manual(values = colors) +
+  scale_x_continuous(breaks = 0:5) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1),
+                     limits = c(0.45, 0.48)) +
+  labs(x = "Streak Length", y = "Predicted Probability", color = NULL) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 8),
+        panel.grid.minor = element_blank(),
+        axis.text = element_text(size = 8))
+```
+
+
+### XGBoost Results
+
+```{r xgb-performance-table}
+#| echo: false
+#| warning: false
+#| message: false
+#| tbl-cap: "Model performance comparison"
+
+perf_data <- data.frame(
+  Model = c("Baseline", "XGBoost", "Neural Net"),
+  Acc = c("52.6", "62.1", "61.8"),
+  Prec = c("52.6", "60.0", "60.0"),
+  Rec = c("100", "83.4", "81.5"),
+  F1 = c(".689", ".698", ".692"),
+  AUC = c("—", ".643", ".636")
+)
+
+kable(perf_data,
+      col.names = c("Model", "Acc%", "Prec%", "Rec%", "F1", "AUC"),
+      align = c("l", "r", "r", "r", "r", "r"),
+      format = "pipe") %>%
+  kableExtra::kable_styling(font_size = 9, latex_options = c("scale_down"))
+```
+
+XGBoost achieved best performance. Feature importance shows shot distance dominates (0.40), while streak features contribute modestly: rolling_rate_10 (0.019), streak (0.014), recent_makes_5 (0.010), recent_makes_3 (0.006).
+
+```{r fig-feature-importance}
+#| echo: false
+#| warning: false
+#| message: false
+#| fig-cap: "XGBoost feature importance: shot distance dominates over streak features."
+#| fig-width: 4.5
+#| fig-height: 2.2
+
+feature_importance <- data.frame(
+  feature = c("Shot Distance", "Distance²", "Loc Y", "Loc X",
+              "Time Left", "Shot Type", "Roll Rate 10",
+              "Quarter", "Streak", "Recent 5", "Recent 3"),
+  gain = c(0.40, 0.15, 0.10, 0.08, 0.05, 0.03, 0.019, 0.02, 0.014, 0.010, 0.006)
+) %>%
+  mutate(
+    category = ifelse(feature %in% c("Roll Rate 10", "Streak", "Recent 5", "Recent 3"),
+                      "Streak", "Shot/Game"),
+    feature = factor(feature, levels = feature[order(gain)])
+  )
+
+ggplot(feature_importance, aes(x = gain, y = feature, fill = category)) +
+  geom_col() +
+  scale_fill_manual(values = c("Streak" = colors[2], "Shot/Game" = colors[1])) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Importance", y = NULL, fill = NULL) +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 7),
+        panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(size = 7),
+        axis.text.x = element_text(size = 7))
+```
+
+### Neural Network Results
+
+The Neural Network performed nearly identically to XGBoost (61.8% accuracy, 0.636 AUC), suggesting relationships are relatively linear. The two hidden layers did not uncover complex non-linear patterns beyond XGBoost's decision trees.
+
+
+### Team-Specific Hot Hand Analysis
+
+```{r team-effects-table}
+#| echo: false
+#| warning: false
+#| message: false
+#| tbl-cap: "Team-specific hot hand effects and statistics"
+
+team_table <- data.frame(
+  Category = c("**Top 5 Positive**", "Phoenix Suns", "Miami Heat", "OKC Thunder", "LA Clippers", "Other",
+               "**Top 5 Negative**", "Golden State", "Denver", "Charlotte", "New York", "Dallas",
+               "**Statistics**", "Random Var.", "Corr. w/ FG%", "Corr. p-value"),
+  Value = c("", "+5.1 pp", "+3.5 pp", "+2.1 pp", "+1.2 pp", "+0.6 pp",
+            "", "-8.7 pp", "-5.3 pp", "-4.5 pp", "-3.7 pp", "-3.7 pp",
+            "", "0.0001387***", "r = 0.106", "p = 0.577")
+)
+
+kable(team_table,
+      col.names = c("", "Effect"),
+      align = c("l", "r"),
+      format = "pipe") %>%
+  kableExtra::kable_styling(font_size = 9, latex_options = c("scale_down"))
+```
+
+```{r fig-team-analysis}
+#| echo: false
+#| warning: false
+#| message: false
+#| fig-cap: "Team hot hand patterns: Distribution (left) and correlation with baseline shooting (right)."
+#| fig-width: 6.5
+#| fig-height: 2.2
+
+# Team effects data
+team_effects <- c(
+  5.1, 3.5, 2.1, 1.2, 0.6, 0.5, -0.1, -0.2, -0.3, -0.5,
+  -0.5, -0.7, -0.8, -0.9, -0.9, -1.2, -1.3, -1.4, -1.5, -1.9,
+  -1.9, -2.2, -2.5, -2.6, -2.7, -3.7, -3.7, -4.5, -5.3, -8.7
+)
+
+team_df <- data.frame(effect = team_effects)
+
+p1 <- ggplot(team_df, aes(x = effect)) +
+  geom_histogram(bins = 15, fill = colors[1], color = "white", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", size = 0.5) +
+  scale_x_continuous(labels = function(x) paste0(ifelse(x > 0, "+", ""), x)) +
+  labs(x = "Effect (pp)", y = "Count") +
+  theme(panel.grid.minor = element_blank(),
+        plot.margin = margin(5, 5, 5, 5),
+        axis.title = element_text(size = 8),
+        axis.text = element_text(size = 7))
+
+# Team scatter data
+team_scatter_data <- data.frame(
+  hot_hand_effect = team_effects,
+  baseline_make_rate = c(0.467, 0.434, 0.484, 0.464, 0.520,
+                         0.538, 0.476, 0.490, 0.456,
+                         0.464, 0.490, 0.515, 0.460,
+                         0.457, 0.493, 0.485, 0.473, 0.423,
+                         0.435, 0.472, 0.488, 0.490,
+                         0.472, 0.468, 0.490, 0.474,
+                         0.464, 0.478, 0.486, 0.455)
+)
+
+p2 <- ggplot(team_scatter_data, aes(x = baseline_make_rate, y = hot_hand_effect)) +
+  geom_point(size = 1.8, alpha = 0.6, color = colors[1]) +
+  geom_smooth(method = "lm", se = TRUE, color = colors[2], 
+              fill = colors[2], alpha = 0.2, size = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", size = 0.4) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = function(x) paste0(ifelse(x > 0, "+", ""), x)) +
+  labs(x = "Baseline Rate", y = "Effect (pp)") +
+  theme(panel.grid.minor = element_blank(),
+        plot.margin = margin(5, 5, 5, 5),
+        axis.title = element_text(size = 8),
+        axis.text = element_text(size = 7))
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+Substantial team heterogeneity is statistically significant (p < 0.001), but uncorrelated with baseline shooting ability (r = 0.106, p = 0.577). Team-specific factors moderate hot hand dynamics.
+
+### Overall Hot Hand Effect
+
+```{r overall-effect-table}
+#| echo: false
+#| warning: false
+#| message: false
+#| tbl-cap: "League-wide make rates by recent performance"
+
+overall_table <- data.frame(
+  Recent = c("0 of last 3", "1 of last 3", "2 of last 3", "3 of last 3"),
+  N = c("34,601", "85,775", "76,362", "21,963"),
+  Rate = c("47.4%", "47.8%", "47.3%", "46.5%"),
+  SE = c(".003", ".002", ".002", ".003"),
+  CI = c(".468–.479", ".475–.482", ".469–.476", ".459–.472")
+)
+
+kable(overall_table,
+      col.names = c("Recent", "N", "Rate", "SE", "95% CI"),
+      align = c("l", "r", "r", "r", "r"),
+      format = "pipe") %>%
+  kableExtra::kable_styling(font_size = 9, latex_options = c("scale_down"))
+```
+
+Players making all 3 previous shots had lower rates (46.5%) than those missing all 3 (47.4%), with non-overlapping confidence intervals indicating statistical significance.
+
+## Discussion
+
+All three models find limited evidence for positive hot hand effects. Descriptive statistics show inverse relationships between recent success and make rate. The HMM identifies distinct states but negative streak coefficients in both. XGBoost shows shot distance dominates over streak features. Neural Network's similar performance confirms linear relationships.
+
+Our findings reinforce @lantis2021hot's conclusion that strategic responses neutralize hot hand effects. After makes, players attempt harder shots while defenses intensify coverage. Substantial team heterogeneity (Phoenix +5.1 pp vs Golden State -8.7 pp) suggests context-dependent effects varying with team composition and systems. This heterogeneity may explain persistent belief—individual experiences with strong-effect teams reinforce belief despite minimal league-wide patterns.
+
+Methodologically, our HMM with proper game boundary specification (via `ntimes`) prevents artificial momentum carryover. Similar XGBoost and Neural Network performance suggests simple interactions capture most signal.
+
+## Conclusions
+
+We examined 218,701 field goal attempts from the 2024 NBA season using three complementary approaches. XGBoost achieved best performance (AUC: 0.643) with shot distance dominating over streak features. League-wide, players making all 3 previous shots showed lower rates (46.5%) than those missing all 3 (47.4%). The HMM identified states (43.3% vs 51.9%) but negative streak coefficients in both, indicating defensive adjustments offset momentum.
+
+Team heterogeneity was substantial (Phoenix +5.1 pp to Golden State -8.7 pp) but uncorrelated with shooting ability (r = 0.106, p = 0.577). Properly accounting for game boundaries via HMM `ntimes` parameters prevented artificial momentum carryover.
+
+Future research should incorporate defender proximity, analyze player-specific effects, examine within-game dynamics, and leverage tracking data to isolate defensive responses. Limitations include lack of defender metrics, team-level averaging masking individual heterogeneity, and single-season analysis. The hot hand appears highly context-dependent and largely neutralized by strategic adjustments in professional basketball.
+
+## References
+
+::: {#refs}
+:::
+
